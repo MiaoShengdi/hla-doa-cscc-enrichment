@@ -1,56 +1,56 @@
 #######################################################################
-# ORA enrichment analysis (differentially expressed genes)
-#   -- GO + KEGG + Hallmark (H) + C7 + C2-Reactome
+# Over-representation analysis of diff genes
+# Collections: GO + KEGG + Hallmark + C7 + C2-Reactome
 # ---------------------------------------------------------------
-# Purpose: over-representation analysis (ORA) of sigDiff.txt, i.e. the
-#          significant genes obtained after virtual overexpression of the
-#          target gene. It answers "which pathways do the diff genes
-#          concentrate in" (presence only, no direction; pathway
-#          direction is handled by GSVA_direction_from_ORA.R).
+# Purpose: perform hypergeometric over-representation analysis (ORA) on
+#          sigDiff.txt, which contains significant differentially regulated
+#          genes obtained after network-level gain-of-function perturbation
+#          of HLA-DOA. This script identifies enriched pathways but does not
+#          determine direction. For direction associated with endogenous
+#          HLA-DOA expression, use GSVA_direction_from_ORA.R.
 # Gene sets and backgrounds:
-#   - GO (BP/CC/MF)        : enrichGO, background = all annotated genes
-#                            in org.Hs.eg.db
-#   - KEGG                  : enrichKEGG, background = all KEGG-annotated genes
-#   - H / C7 / C2-Reactome  : enricher, background = union of the selected
-#                            MSigDB gene sets
-# Output (ORA_out/): ORA_GO.txt / ORA_KEGG.txt / ORA_H.txt /
-#                    ORA_C7.txt / ORA_C2Reactome.txt,
-#                    plus bar plots and dot plots
-# Filtering: nominal p < 0.05 (p.adjust is left unrestricted, consistent
-#            with the analysis reported in the manuscript)
-# Note: keep this file in UTF-8 encoding
+#   - GO (BP/CC/MF): enrichGO; all annotated genes in org.Hs.eg.db
+#   - KEGG: enrichKEGG; all KEGG-annotated genes
+#   - H / C7 / C2-Reactome: enricher; union of the selected MSigDB gene sets
+# Outputs (ORA_out/): ORA_GO.txt / ORA_KEGG.txt / ORA_H.txt /
+#                     ORA_C7.txt / ORA_C2Reactome.txt, bar plots, and dot plots
+# Filtering: nominal P < 0.05, with no restriction on p.adjust
+#
+# [Revisions, 2026-11-02]
+#   - Added tryCatch handling for enrichKEGG because failures of the online
+#     KEGG API can otherwise interrupt the script.
+#   - Added NA filtering during KEGG ENTREZID-to-SYMBOL conversion to prevent
+#     "NA" strings from appearing in geneID.
+#   - All other logic, column names, and output filenames remain unchanged;
+#     the GSVA script depends on this output format.
+# Save this file with UTF-8 encoding
+# (RStudio: File -> Save with Encoding -> UTF-8).
 #######################################################################
-
 library(clusterProfiler)
 library(org.Hs.eg.db)
 library(enrichplot)
 library(ggplot2)
 library(msigdbr)
 library(dplyr)
-
 # ===================== 0. Settings =====================
-sigDiffFile    <- "sigDiff.txt"         # input: table of significant genes (1st column = gene symbol)
-outDir         <- "ORA_out"             # output directory
-species        <- "Homo sapiens"        # species: Homo sapiens / Mus musculus
-pvalueFilter   <- 0.05                  # nominal P cutoff
-p.adjustFilter <- 1                     # adjusted P cutoff (1 = unrestricted, filter on nominal P only)
-minGSSize      <- 5                     # minimum gene-set size for enricher (smaller sets are dropped)
-topN           <- 30                    # number of pathways shown in the plots
-
+sigDiffFile    <- "sigDiff.txt"         # Input: table of significant diff genes; first column contains gene symbols
+outDir         <- "ORA_out"             # Output directory
+species        <- "Homo sapiens"        # Species: Homo sapiens / Mus musculus
+pvalueFilter   <- 0.05                  # Nominal P-value threshold
+p.adjustFilter <- 1                     # Adjusted P-value threshold; 1 means unrestricted, so filtering uses nominal P only
+minGSSize      <- 5                     # Minimum gene-set size for enricher; smaller sets are excluded
+topN           <- 30                    # Number of pathways displayed in plots
 dir.create(outDir, showWarnings = FALSE, recursive = TRUE)
 colorSel <- if (p.adjustFilter > 0.05) "pvalue" else "p.adjust"
-
-# ===================== 1. Read the diff genes =====================
+# ===================== 1. Read diff genes =====================
 rt <- read.table(sigDiffFile, header = TRUE, sep = "\t", check.names = FALSE)
 genes <- unique(as.vector(rt[, 1]))
 cat("输入显著基因数:", length(genes), "\n")
-
-# symbol -> ENTREZID (required by enrichGO / enrichKEGG)
+# Convert gene symbols to ENTREZID, as required by enrichGO and enrichKEGG
 entrez <- mapIds(org.Hs.eg.db, keys = genes, column = "ENTREZID", keytype = "SYMBOL")
 geneEntrez <- as.character(entrez[!is.na(entrez)])
 cat("转换到 ENTREZID 的基因数:", length(geneEntrez), "\n")
-
-# ===================== 2. GO / KEGG ORA (whole-genome background) =====================
+# ===================== 2. GO and KEGG ORA using whole-genome backgrounds =====================
 # ---- GO (BP/CC/MF) ----
 kkGO <- enrichGO(gene = geneEntrez, OrgDb = org.Hs.eg.db,
                  pvalueCutoff = 1, qvalueCutoff = 1, ont = "all", readable = TRUE)
@@ -59,32 +59,43 @@ GO <- GO[GO$pvalue < pvalueFilter & GO$p.adjust < p.adjustFilter, ]
 write.table(GO, file = file.path(outDir, "ORA_GO.txt"), sep = "\t",
             quote = FALSE, row.names = FALSE)
 cat("GO 富集通路数(p<0.05):", nrow(GO), "\n")
-
-# ---- KEGG ----
-kkKEGG <- enrichKEGG(gene = geneEntrez, organism = "hsa",
-                     pvalueCutoff = 1, qvalueCutoff = 1)
-KEGG <- as.data.frame(kkKEGG)
+# ---- KEGG: use tryCatch so that KEGG API/network failures do not interrupt the entire script ----
+kkKEGG <- tryCatch(
+  enrichKEGG(gene = geneEntrez, organism = "hsa",
+             pvalueCutoff = 1, qvalueCutoff = 1),
+  error = function(e) {
+    cat("[警告] enrichKEGG 失败（多为网络/KEGG API 问题）:", e$message, "\n")
+    NULL
+  }
+)
+KEGG <- if (!is.null(kkKEGG)) as.data.frame(kkKEGG) else data.frame()
 KEGG <- KEGG[KEGG$pvalue < pvalueFilter & KEGG$p.adjust < p.adjustFilter, ]
 if (nrow(KEGG) > 0) {
   eg2sym <- mapIds(org.Hs.eg.db, keys = unique(unlist(strsplit(KEGG$geneID, "/"))),
                    column = "SYMBOL", keytype = "ENTREZID")
-  KEGG$geneSym <- sapply(strsplit(KEGG$geneID, "/"), function(x)
-    paste(eg2sym[x], collapse = "/"))
+  KEGG$geneSym <- sapply(strsplit(KEGG$geneID, "/"), function(x) {
+    s <- eg2sym[x]
+    s <- s[!is.na(s)]                      # Remove ENTREZIDs without a gene-symbol mapping
+    paste(s, collapse = "/")
+  })
   KEGG$geneID <- KEGG$geneSym
+  KEGG <- KEGG[KEGG$geneID != "", , drop = FALSE]
 }
 write.table(KEGG, file = file.path(outDir, "ORA_KEGG.txt"), sep = "\t",
             quote = FALSE, row.names = FALSE)
 cat("KEGG 富集通路数(p<0.05):", nrow(KEGG), "\n")
-
-# ===================== 3. H / C7 / C2-Reactome ORA (pre-defined MSigDB sets) =====================
-# Note: enricher takes gene symbols (the gene_symbol column of msigdbr),
-#       not the ENTREZID used above.
+# ===================== 3. ORA for H, C7, and C2-Reactome using predefined MSigDB gene sets =====================
+# Note: enricher requires gene symbols matching the gene_symbol column in
+# msigdbr; do not use the ENTREZIDs generated above.
 runMSigORA <- function(nm, t2g) {
   cat("\n########## 正在处理:", nm, "##########\n")
   t2g <- as.data.frame(t2g)
-  kk <- enricher(gene = genes, TERM2GENE = t2g,
-                 pvalueCutoff = 1, qvalueCutoff = 1,
-                 minGSSize = minGSSize)
+  kk <- tryCatch(
+    enricher(gene = genes, TERM2GENE = t2g,
+             pvalueCutoff = 1, qvalueCutoff = 1,
+             minGSSize = minGSSize),
+    error = function(e) { cat("  [警告]", nm, "enricher 失败:", e$message, "\n"); NULL }
+  )
   if (is.null(kk) || nrow(as.data.frame(kk)) == 0) {
     cat("  ", nm, "无任何富集结果\n")
     return(NULL)
@@ -98,15 +109,12 @@ runMSigORA <- function(nm, t2g) {
   cat("富集通路数(p<0.05):", nrow(res), "\n")
   list(kk = kk, res = res)
 }
-
-# ---- H (Hallmark, all 50 sets) ----
+# ---- Hallmark: all 50 gene sets ----
 h_gs <- msigdbr(species = species, collection = "H") %>%
   dplyr::select(gs_name, gene_symbol)
 cat("\nHallmark 基因集数:", length(unique(h_gs$gs_name)), "\n")
 outH <- runMSigORA("H", h_gs)
-
-# ---- C7 immune signatures (selected: M1/M2 plus antigen processing /
-#      presentation, MHC, phagocytosis, lysosome) ----
+# ---- C7 immune signatures: selected M1/M2, antigen processing/presentation, MHC, phagocytosis, and lysosome sets ----
 c7_all <- msigdbr(species = species, collection = "C7") %>%
   dplyr::select(gs_name, gene_symbol)
 c7_keep <- unique(c(
@@ -118,9 +126,7 @@ c7_keep <- unique(c(
 cat("C7 精选免疫签名数:", length(c7_keep), "\n")
 print(c7_keep)
 outC7 <- runMSigORA("C7", c7_all[c7_all$gs_name %in% c7_keep, ])
-
-# ---- C2-Reactome (selected: lysosome / phagosome / antigen processing
-#      and presentation) ----
+# ---- C2-Reactome: selected lysosome, phagosome, and antigen processing/presentation pathways ----
 c2r_all <- msigdbr(species = species, collection = "C2", subcollection = "CP:REACTOME") %>%
   dplyr::select(gs_name, gene_symbol)
 c2r_keep <- grep("LYSOSOME|PHAGOSOME|ANTIGEN_PROCESSING|MHC_CLASS",
@@ -128,8 +134,7 @@ c2r_keep <- grep("LYSOSOME|PHAGOSOME|ANTIGEN_PROCESSING|MHC_CLASS",
 cat("C2-Reactome 精选通路数:", length(c2r_keep), "\n")
 print(c2r_keep)
 outC2R <- runMSigORA("C2Reactome", c2r_all[c2r_all$gs_name %in% c2r_keep, ])
-
-# ===================== 4. Plots (bar plot + dot plot) =====================
+# ===================== 4. Generate bar plots and dot plots =====================
 plotORA <- function(kk, nm) {
   if (is.null(kk) || nrow(as.data.frame(kk)) == 0) {
     cat("  ", nm, "无显著通路，跳过绘图\n")
@@ -145,21 +150,20 @@ plotORA <- function(kk, nm) {
   dev.off()
   cat("  图表已保存:", nm, "\n")
 }
-
 plotORA(kkGO, "GO")
-plotORA(kkKEGG, "KEGG")
+plotORA(if (!is.null(kkKEGG)) kkKEGG else NULL, "KEGG")
 plotORA(if (!is.null(outH)) outH$kk else NULL, "H")
 plotORA(if (!is.null(outC7)) outC7$kk else NULL, "C7")
 plotORA(if (!is.null(outC2R)) outC2R$kk else NULL, "C2Reactome")
-
 cat("\n全部完成，输出目录:", outDir, "\n")
-
 #######################################################################
 # Output description
 # - ORA_GO.txt / ORA_KEGG.txt / ORA_H.txt / ORA_C7.txt /
-#   ORA_C2Reactome.txt : enrichment tables for each collection (nominal p < 0.05)
-# - ORA_*.barplot.pdf / ORA_*.bubble.pdf : bar plots / dot plots
-# - This script only reports "where the diff genes are enriched" (no
-#   direction). Pathway direction under the overexpressed state is
-#   obtained with GSVA_direction_from_ORA.R.
+#   ORA_C2Reactome.txt: enrichment tables for each collection (nominal P < 0.05)
+# - ORA_*.barplot.pdf / ORA_*.bubble.pdf: bar plots and dot plots
+# - This script identifies enriched pathways without assigning direction.
+#   To evaluate pathway scores in relation to endogenous HLA-DOA-high versus
+#   HLA-DOA-low expression, use GSVA_direction_from_ORA.R.
+# - If KEGG fails, an empty table is written or plotting is skipped without
+#   affecting the GO and MSigDB analyses.
 #######################################################################
