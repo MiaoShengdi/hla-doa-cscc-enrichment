@@ -1,27 +1,33 @@
 #######################################################################
-# GSVA direction analysis (on the ORA-enriched pathways)
-#   -- assigns a sign (up / down) to the pathways enriched by the diff genes
+# GSVA 方向性分析（基于 ORA 富集通路）—— 给"diff genes 富集到的通路"加正负方向
 # ---------------------------------------------------------------
-# Purpose: read the ORA tables (ORA_GO.txt / ORA_KEGG.txt / ORA_H.txt /
-#          ORA_C7.txt / ORA_C2Reactome.txt, produced by ORA_diffgenes_all.R),
-#          build a gene module from the diff-gene members of every
-#          significant pathway, then score each module by GSVA and compare
-#          groups with limma, so that each pathway receives an up / down
-#          direction in the "target gene high" (virtual overexpression)
-#          group.
-# Direction interpretation:
-#   - logFC > 0 : the pathway is more active in the HLA-DOA-high group
-#                 (positive / up-regulated)
-#   - logFC < 0 : the pathway is more active in the HLA-DOA-low group
-#                 (negative / down-regulated)
-# Fallback: when an ORA table is empty or missing (C7 usually has no
-#          significant pathway), the script switches to the pre-defined
-#          MSigDB sets (all H / selected C7 / selected C2-Reactome) for
-#          GSVA. The switch is printed to the console, so every collection
-#          still yields a direction table.
-# Note: keep this file in UTF-8 encoding
+# 作用：读取 ORA 富集表（ORA_GO.txt / ORA_KEGG.txt / ORA_H.txt /
+#       ORA_C7.txt / ORA_C2Reactome.txt，来自 ORA_diffgenes_all.R 或
+#       你已有的 GO/KEGG、H/C7/C2 富集脚本输出），把每条显著通路的
+#       diff 基因成员构造成基因模块，再做 GSVA 打分 + limma 组间比较，
+#       得到每条通路在内源性 HLA-DOA 高/低表达组之间的评分差异。
+# 方向解读：
+#   - logFC>0 = HLA-DOA 高表达组该通路的 GSVA 评分更高
+#   - logFC<0 = HLA-DOA 低表达组该通路的 GSVA 评分更高
+# 回退机制：某集合 ORA 表为空或缺失时（如 C7 常无显著通路），
+#       自动改用 MSigDB 预设基因集（H 全部 / C7 精选 / C2-Reactome 精选）
+#       做 GSVA，控制台会打印注明，保证每个集合都有方向结果。
+#
+# 【2026-11-02 偏倚修正（重要，务必阅读）】
+# 排查发现原脚本存在分组系统性偏倚，导致方向结果几乎全正向（GO 434/436）：
+#   ① 62.1% 细胞 HLA-DOA 零表达 → 全细胞中位数 = 0，median 分组实际是
+#      "表达 vs 不表达"，而非"高 vs 低表达"；
+#   ② "high 组"（表达 HLA-DOA 的细胞）nCount/nFeature 为 low 组的 2.6/1.8 倍，
+#      属于更活化/更高测序深度的细胞，GSVA 分数因此整体上移。
+#   随机基因集阴性对照（100 个，正向显著 3/100）未提示管线本身存在系统性方向偏倚。
+# 本次修正：
+#   A. 分组改为"仅在 HLA-DOA 表达>0 的细胞内按中位数切 high/low"；
+#   B. limma 设计矩阵加入 sizeFactor（伪样本 log 总表达量）协变量，
+#      校正测序深度/活化差异；
+#   C. 修正 coefName 提取（model.matrix 会把连字符转为点，原固定字符串会报错）。
+# 修正后方向结果方可用于论文；论文方法学应写明上述分组与校正策略。
+# 注意：请用 UTF-8 编码保存（RStudio: File -> Save with Encoding -> UTF-8）
 #######################################################################
-
 suppressPackageStartupMessages({
   library(Seurat)
   library(GSVA)
@@ -33,28 +39,24 @@ suppressPackageStartupMessages({
   library(ggplot2)
   library(dplyr)
 })
-
 set.seed(123)
-
-# ===================== 0. Settings =====================
-targetGene        <- "HLA-DOA"      # target gene (used for expression-based grouping, i.e. the virtual overexpression state)
-cellName          <- "macrophages"  # cell type analysed
-keepTypes         <- c("Control", "Treat") # sample groups kept for analysis
-dataFile          <- "seurat.Rdata"  # input 1: Seurat object (must be named `pbmc`)
-oraDir            <- "ORA_out"       # input 2: directory holding the ORA tables
-sigDiffFile       <- "sigDiff.txt"   # input 3 (optional): diff-gene table (whole-module direction)
-outDir            <- "GSVA_out"      # output directory
+# ===================== 0. 参数设置（按你的数据修改） =====================
+targetGene        <- "HLA-DOA"      # 目标基因（用于内源性表达分组，不等同于虚拟网络扰动）
+cellName          <- "macrophages" # 细胞类型
+keepTypes         <- c("Treat")     # 论文分析仅纳入 CSCC（Treat）样本组
+dataFile          <- "seurat.Rdata"  # 输入1：Seurat 对象
+oraDir            <- "ORA_out"       # 输入2：ORA 富集表所在目录
+sigDiffFile       <- "sigDiff.txt"   # 输入3（可选）：差异基因表（整体模块）
+outDir            <- "GSVA_out"      # 输出目录
 species           <- "Homo sapiens"
-groupMethod       <- "median"        # "median" = median split; "expressed" = expressed (>0) vs not expressed
+groupMethod       <- "median"        # "median"=中位数分组；"expressed"=按是否表达(>0)分组
 minCellsPerSample <- 10
 pairedBySample    <- TRUE
-minModuleSize     <- 5               # minimum gene-module size (smaller modules are dropped)
+minModuleSize     <- 5               # 基因模块最少基因数（不足剔除）
 topN              <- 30
-useFallback       <- TRUE            # TRUE = fall back to pre-defined MSigDB sets when ORA is empty
-
+useFallback       <- TRUE            # TRUE=ORA 为空时回退 MSigDB 预设基因集
 dir.create(outDir, showWarnings = FALSE, recursive = TRUE)
-
-# ===================== Helper functions (plotting) =====================
+# ===================== 辅助函数（作图用） =====================
 cleanName <- function(x) {
   x <- gsub("^HALLMARK_|^REACTOME_|^KEGG_|^GOBP_|^GOCC_|^GOMF_", "", x)
   x <- gsub("_", " ", x)
@@ -65,11 +67,9 @@ strwrap2 <- function(x, width = 45) {
     paste(strwrap(s, width = width), collapse = "\n"), character(1))
 }
 sigStar <- function(p, padj) ifelse(padj < 0.05, "**", ifelse(p < 0.05, "*", ""))
-
-# ===================== 1. Read the inputs =====================
+# ===================== 1. 读取输入 =====================
 load(dataFile)
 stopifnot(exists("pbmc"))
-
 if ("Type" %in% colnames(pbmc@meta.data) && !is.null(keepTypes)) {
   pbmc <- subset(pbmc, subset = Type %in% keepTypes)
   cat("保留样本组:", paste(keepTypes, collapse = ", "), "\n")
@@ -77,23 +77,34 @@ if ("Type" %in% colnames(pbmc@meta.data) && !is.null(keepTypes)) {
 pbmc <- subset(pbmc, subset = cellType == cellName)
 cat("剩余细胞数:", ncol(pbmc), "\n")
 stopifnot(targetGene %in% rownames(pbmc))
-
 geneExpr <- GetAssayData(pbmc, assay = "RNA", layer = "data")[targetGene, ]
+# ----【修正 A】分组：仅在表达>0 的细胞内按中位数切组，避免零膨胀退化成"表达 vs 不表达" ----
 if (groupMethod == "median") {
+  posCells <- geneExpr > 0
+  cat("HLA-DOA 表达>0 细胞比例:", round(mean(posCells) * 100, 1), "%\n")
+  pbmc <- pbmc[, posCells]                                  # 剔除零表达细胞
+  geneExpr <- GetAssayData(pbmc, assay = "RNA", layer = "data")[targetGene, ]
   pbmc$gene_group <- ifelse(geneExpr > median(geneExpr), "HLA-DOA-high", "HLA-DOA-low")
 } else {
   pbmc$gene_group <- ifelse(geneExpr > 0, "HLA-DOA-high", "HLA-DOA-low")
 }
 print(table(pbmc$gene_group))
-
+# ----【修正 A 复核】分组修正后 high/low 细胞质量是否仍失衡（期望差异大幅缩小） ----
+cat("\n【分组修正后质量复核】\n")
+for (m in c("nCount_RNA", "nFeature_RNA")) {
+  hi <- pbmc[[m]][pbmc$gene_group == "HLA-DOA-high", 1]
+  lo <- pbmc[[m]][pbmc$gene_group == "HLA-DOA-low",  1]
+  w  <- suppressWarnings(wilcox.test(hi, lo))
+  cat(m, "| high中位:", round(median(hi), 1),
+      " low中位:", round(median(lo), 1),
+      " | wilcoxon P:", format.pval(w$p.value, digits = 3), "\n")
+}
 if (!"orig.ident" %in% colnames(pbmc@meta.data)) pbmc$orig.ident <- "sample"
 pbmc$grp <- if ("Type" %in% colnames(pbmc@meta.data))
   paste(pbmc$Type, pbmc$orig.ident, pbmc$gene_group, sep = ".") else
   paste(pbmc$orig.ident, pbmc$gene_group, sep = ".")
-
 ncells <- table(pbmc$grp)
 cat("各伪样本细胞数:\n"); print(ncells)
-
 pseudo <- AggregateExpression(pbmc, group.by = "grp", assays = "RNA",
                               return.seurat = FALSE)$RNA
 keepCols  <- names(ncells)[ncells >= minCellsPerSample]
@@ -102,16 +113,20 @@ if (length(keepCols) < 2) stop("伪样本不足 2 个：请调低 minCellsPerSam
 pseudo    <- pseudo[, keepCols, drop = FALSE]
 keepRows  <- rowSums(pseudo > 0) >= 2
 pseudo    <- pseudo[keepRows, , drop = FALSE]
-pseudo    <- cpm(pseudo, log = TRUE)          # log2-CPM over all genes
+pseudo    <- cpm(pseudo, log = TRUE)          # 全基因 log2-CPM
 cat("伪样本:", colnames(pseudo), "\n")
-
+# ----【修正 B】sizeFactor：每个伪样本的 log 总表达量（测序深度/活化协变量） ----
+aggCounts  <- AggregateExpression(pbmc, group.by = "grp", assays = "RNA",
+                                  return.seurat = FALSE)$RNA
+sizeFactor <- log(colSums(aggCounts[, keepCols, drop = FALSE]))
+names(sizeFactor) <- keepCols
+cat("sizeFactor（log 总表达量）:\n"); print(round(sizeFactor, 2))
 pseudoType <- unique(gsub("\\..*$", "", colnames(pseudo)))
 typeLabel  <- if (length(pseudoType) == 1) {
   if (pseudoType == "Control") "Control group (normal)" else "Treat group (disease)"
 } else paste(paste(pseudoType, collapse = " + "), "groups")
 footNote <- paste0(typeLabel, "  |  Cell type: ", cellName)
-
-# ===================== 2. Read the ORA tables and build the modules =====================
+# ===================== 2. 读取 ORA 表，构建模块基因集 =====================
 readOraTable <- function(f) {
   p <- file.path(oraDir, f)
   if (!file.exists(p)) { cat("  [提示] 未找到", f, "，视为空\n"); return(NULL) }
@@ -119,9 +134,7 @@ readOraTable <- function(f) {
   if (nrow(df) == 0) return(NULL)
   df
 }
-
-# Build one gene module per significant pathway from its diff-gene members
-# (geneID column, "/"-separated symbols)
+# 把 ORA 显著通路的 diff 基因成员（geneID，"/"分隔，symbol）构造成基因模块
 oraModules <- function(ora) {
   gsList <- lapply(seq_len(nrow(ora)), function(i) {
     genes <- unique(strsplit(ora$geneID[i], "/")[[1]])
@@ -133,8 +146,7 @@ oraModules <- function(ora) {
   if (length(gsList) == 0) return(NULL)
   GeneSetCollection(gsList)
 }
-
-# Pre-defined MSigDB sets (used as fallback)
+# MSigDB 预设基因集（回退用）
 df2gsc <- function(df) {
   gs <- split(df$gene_symbol, df$gs_name)
   gs <- lapply(gs, unique)
@@ -165,15 +177,13 @@ buildFallback <- function(nm) {
     df2gsc(c2r_all[c2r_all$gs_name %in% c2r_keep, ])
   }
 }
-
 collections <- list(
-  GO         = list(file = "ORA_GO.txt",         fallback = FALSE),
-  KEGG       = list(file = "ORA_KEGG.txt",       fallback = FALSE),
-  H          = list(file = "ORA_H.txt",          fallback = TRUE),
-  C7         = list(file = "ORA_C7.txt",         fallback = TRUE),
+  GO         = list(file = "ORA_GO.txt",        fallback = FALSE),
+  KEGG       = list(file = "ORA_KEGG.txt",      fallback = FALSE),
+  H          = list(file = "ORA_H.txt",         fallback = TRUE),
+  C7         = list(file = "ORA_C7.txt",        fallback = TRUE),
   C2Reactome = list(file = "ORA_C2Reactome.txt", fallback = TRUE)
 )
-
 gscList <- list()
 displayList <- list()
 for (nm in names(collections)) {
@@ -181,7 +191,7 @@ for (nm in names(collections)) {
   gsc <- NULL; disp <- NULL
   if (!is.null(ora)) {
     gsc  <- oraModules(ora)
-    disp <- setNames(ora$Description, ora$ID)   # pathway names shown in the plots
+    disp <- setNames(ora$Description, ora$ID)   # 图上显示通路名
     cat(nm, ": ORA 显著通路", nrow(ora), "条 → 可用模块",
         ifelse(is.null(gsc), 0, length(gsc)), "个\n")
   }
@@ -193,8 +203,7 @@ for (nm in names(collections)) {
   gscList[[nm]]     <- gsc
   displayList[[nm]] <- disp
 }
-
-# Whole diff-gene module (optional): all diff genes as a single set; direction only, no plot
+# 整体差异基因模块（可选）：所有 diff genes 作为一个基因集，只报告方向、不出图
 gscAll <- NULL
 if (file.exists(sigDiffFile)) {
   sig <- read.delim(sigDiffFile, stringsAsFactors = FALSE)
@@ -204,32 +213,32 @@ if (file.exists(sigDiffFile)) {
     gscAll <- GeneSet(sg, setName = paste0(targetGene, "_diff_all"))
   cat("整体 diff genes 模块基因数:", length(sg), "\n")
 }
-
-# ===================== 3. Per collection: GSVA + limma direction + plots =====================
+# ===================== 3. 每个集合：GSVA + limma 方向 + 出图 =====================
 runSet <- function(nm, gsc, display = NULL) {
   cat("\n########## 正在处理:", nm, "##########\n")
   if (is.null(gsc)) { message("  ", nm, " 无可用基因集，跳过"); return(NULL) }
   if (!is.null(gscAll)) gsc <- GeneSetCollection(c(gsc, gscAll))
-
-  # ---- GSVA scoring (the expression matrix always keeps all genes) ----
+  # ---- GSVA 打分（表达矩阵始终全基因） ----
   gp <- gsvaParam(exprData = pseudo, geneSets = gsc,
                   kcdf = "Gaussian", maxDiff = TRUE, tau = 1)
   es <- gsva(gp)
   write.csv(es, file.path(outDir, paste0("GSVA_scores_", nm, ".csv")))
-
-  # ---- limma: HLA-DOA-high vs HLA-DOA-low ----
+  # ---- limma 比较 HLA-DOA-high vs HLA-DOA-low（校正 sizeFactor + Type） ----
   grp  <- factor(gsub(".*\\.", "", colnames(es)), levels = c("HLA-DOA-low", "HLA-DOA-high"))
   type <- gsub("\\..*$", "", colnames(es))
+  sf   <- sizeFactor[colnames(es)]            # 伪样本测序深度协变量
   if (length(unique(type)) > 1) {
     type <- factor(type)
-    design <- model.matrix(~ type + grp)
-    coefName <- "grpHLA-DOA-high"
-    cat("  设计矩阵: ~ Type + HLA-DOA_group（校正", paste(levels(type), collapse = "/"),
-        "后比较 HLA-DOA 高低）\n")
+    design <- model.matrix(~ sf + type + grp)
+    cat("  设计矩阵: ~ sizeFactor + Type + HLA-DOA_group（校正总表达与",
+        paste(levels(type), collapse = "/"), "后比较 HLA-DOA 高低）\n")
   } else {
-    design <- model.matrix(~ grp)
-    coefName <- "grpHLA-DOA-high"
+    design <- model.matrix(~ sf + grp)
+    cat("  设计矩阵: ~ sizeFactor + HLA-DOA_group\n")
   }
+  # ----【修正 C】动态提取 grp 系数名（model.matrix 会把连字符"转成点"） ----
+  coefName <- grep("^grp", colnames(design), value = TRUE)[1]
+  cat("  比较系数:", coefName, "\n")
   if (pairedBySample) {
     sampleID <- gsub("\\.HLA-DOA-.*$", "", colnames(es))
     corfit   <- duplicateCorrelation(es, design, block = sampleID)
@@ -242,14 +251,12 @@ runSet <- function(nm, gsc, display = NULL) {
   if (!is.null(display)) res$Description <- display[rownames(res)]
   write.csv(res, file.path(outDir, paste0("GSVA_direction_", nm, ".csv")))
   cat("基因集数:", nrow(res), "| 正向:", sum(res$logFC > 0), "| 负向:", sum(res$logFC < 0), "\n")
-
-  # Direction of the whole diff-gene module (printed only, not plotted)
+  # 整体 diff 模块方向（只打印，不出图）
   sigRow <- grep(paste0("^", targetGene, "_diff_all$"), rownames(res))
   if (length(sigRow))
     cat("  [整体模块] diff genes 全部 logFC =", round(res$logFC[sigRow], 3),
         " P =", round(res$P.Value[sigRow], 4), " ->", res$direction[sigRow], "\n")
-
-  # ---- Direction bar plot (topN, cleaned names + significance stars) ----
+  # ---- 方向条形图（topN，清理名称 + 星号） ----
   resMain <- res[!grepl(paste0("^", targetGene, "_diff_all$"), rownames(res)), , drop = FALSE]
   plotDF <- head(resMain[order(abs(resMain$logFC), decreasing = TRUE), ], topN)
   plotDF$label <- if (!is.null(display)) plotDF$Description else cleanName(rownames(plotDF))
@@ -274,8 +281,7 @@ runSet <- function(nm, gsc, display = NULL) {
          width = 9.5, height = h1)
   ggsave(file.path(outDir, paste0("GSVA_direction_barplot_", nm, ".png")), p,
          width = 9.5, height = h1, dpi = 300)
-
-  # ---- Heatmap (topN, column annotation: Type + HLA-DOA group) ----
+  # ---- 热图（topN，列注释含 Type + HLA-DOA） ----
   topIds <- rownames(resMain)[order(abs(resMain$logFC), decreasing = TRUE)][1:min(topN, nrow(resMain))]
   esPlot <- es[topIds, , drop = FALSE]
   colType <- gsub("\\..*$", "", colnames(esPlot))
@@ -308,23 +314,22 @@ runSet <- function(nm, gsc, display = NULL) {
   cat("  图表已保存:", nm, "\n")
   list(res = res, es = es)
 }
-
 for (nm in names(gscList)) {
   out <- runSet(nm, gscList[[nm]], displayList[[nm]])
   assign(paste0("out", nm), out)
 }
-
 cat("\n全部完成，输出目录:", outDir, "\n")
-
 #######################################################################
-# Output description
-# - GSVA_direction_*.csv : per-collection direction tables
-#                          (logFC > 0 = positive / more active in the high group)
-# - GSVA_direction_barplot_*.pdf/png : direction bar plots (with significance stars)
-# - GSVA_heatmap_*.pdf/png : GSVA scores of each pathway across pseudobulk samples
-# - GSVA_scores_*.csv : raw GSVA score matrices
-# - This script answers whether the ORA-enriched pathways are up- or
-#   down-regulated under the overexpressed state; "where the diff genes
-#   are enriched" is answered by ORA_diffgenes_all.R. The two scripts are
-#   designed to be run in this order.
+# 结果说明
+# - GSVA_direction_*.csv：各集合方向表（logFC>0=正向/高表达组活性更高；
+#   已校正 sizeFactor 测序深度与 Type 协变量，基于"表达 HLA-DOA 细胞内部"的分组）
+# - GSVA_direction_barplot_*.pdf/png：方向条形图（带星号）
+# - GSVA_heatmap_*.pdf/png：各通路在各伪样本的 GSVA 分数热图
+# - GSVA_scores_*.csv：原始 GSVA 打分矩阵
+# - 本脚本回答"diff genes 富集到的通路在内源性 HLA-DOA 高/低表达组之间的评分差异"；
+#   该观察性比较不等同于虚拟网络扰动后的直接转录响应。
+#   "富集在哪"由 ORA_diffgenes_all.R 回答，两个脚本配套使用。
+# - 论文方法学表述建议：在表达 HLA-DOA 的巨噬细胞中按表达中位数分为
+#   high/low 两组，伪样本化后以 log 总表达量（sizeFactor）与样本组（Type）
+#   为协变量，limma 比较两组 GSVA 通路分数（duplicateCorrelation 配对样本）。
 #######################################################################
